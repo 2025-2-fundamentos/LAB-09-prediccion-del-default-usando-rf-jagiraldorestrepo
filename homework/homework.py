@@ -92,3 +92,212 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+from __future__ import annotations
+
+import gzip
+import json
+import pickle
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pandas as pd  # type: ignore
+from sklearn.compose import ColumnTransformer  # type: ignore
+from sklearn.ensemble import RandomForestClassifier  # type: ignore
+from sklearn.metrics import (  # type: ignore
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV  # type: ignore
+from sklearn.pipeline import Pipeline  # type: ignore
+from sklearn.preprocessing import OneHotEncoder  # type: ignore
+
+
+@dataclass(frozen=True)
+class RutasProyecto:
+    carpeta_entrada: Path = Path("files/input")
+    carpeta_salida: Path = Path("files/output")
+    carpeta_modelos: Path = Path("files/models")
+    ruta_modelo: Path = Path("files/models/model.pkl.gz")
+    ruta_metricas: Path = Path("files/output/metrics.json")
+
+
+COLUMNAS_CATEGORICAS = ("SEX", "EDUCATION", "MARRIAGE")
+OBJETIVO_CRUDO = "default payment next month"
+OBJETIVO = "default"
+COLUMNAS_A_ELIMINAR = ("ID",)
+
+
+GRILLA_PARAMETROS = {
+    "clf__n_estimators": [100, 200, 500],
+    "clf__max_depth": [None, 5, 10],
+    "clf__min_samples_split": [2, 5],
+    "clf__min_samples_leaf": [1, 2],
+}
+
+
+def leer_csv_desde_zip(ruta_zip: Path) -> pd.DataFrame:
+    """Lee el primer CSV encontrado dentro de un archivo .zip."""
+    with zipfile.ZipFile(ruta_zip, "r") as zf:
+        nombres_csv = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not nombres_csv:
+            raise FileNotFoundError(f"No se encontró CSV dentro de: {ruta_zip}")
+        with zf.open(nombres_csv[0]) as f:
+            return pd.read_csv(f, sep=",", index_col=0)
+
+
+def cargar_train_y_test(carpeta_entrada: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Carga train y test sin depender del orden.
+    Busca .zip con 'train' y 'test' en el nombre; si no, usa los dos primeros.
+    """
+    zips = sorted(carpeta_entrada.glob("*.zip"))
+    if not zips:
+        raise FileNotFoundError(f"No hay archivos .zip en: {carpeta_entrada}")
+
+    ruta_train = next((p for p in zips if "train" in p.name.lower()), None)
+    ruta_test = next((p for p in zips if "test" in p.name.lower()), None)
+
+    if ruta_train is None or ruta_test is None:
+        if len(zips) < 2:
+            raise FileNotFoundError("Se esperaban al menos 2 zips (train y test).")
+        ruta_train, ruta_test = zips[0], zips[1]
+
+    return leer_csv_desde_zip(ruta_train), leer_csv_desde_zip(ruta_test)
+
+
+def guardar_modelo_gzip(ruta: Path, objeto: Any) -> None:
+    """Guarda un objeto pickle comprimido con gzip."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(ruta, "wb") as f:
+        pickle.dump(objeto, f)
+
+
+def escribir_jsonl(ruta: Path, filas: list[dict[str, Any]]) -> None:
+    """Escribe una lista de diccionarios como JSON Lines (una línea por dict)."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    with ruta.open("w", encoding="utf-8") as f:
+        for fila in filas:
+            f.write(json.dumps(fila) + "\n")
+
+
+
+def depurar_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Paso 1:
+    - Renombra 'default payment next month' -> 'default'
+    - Elimina ID
+    - Elimina registros con EDUCATION==0 o MARRIAGE==0
+    - EDUCATION > 4 -> 4 (others)
+    - Quita NA
+    """
+    out = df.copy()
+
+    if OBJETIVO_CRUDO in out.columns:
+        out = out.rename(columns={OBJETIVO_CRUDO: OBJETIVO})
+
+    for col in COLUMNAS_A_ELIMINAR:
+        if col in out.columns:
+            out = out.drop(columns=col)
+
+    if "MARRIAGE" in out.columns:
+        out = out.loc[out["MARRIAGE"] != 0]
+
+    if "EDUCATION" in out.columns:
+        out = out.loc[out["EDUCATION"] != 0]
+        out["EDUCATION"] = out["EDUCATION"].where(out["EDUCATION"] <= 4, 4)
+
+    return out.dropna()
+
+
+def separar_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Separa variables explicativas (X) y objetivo (y)."""
+    x = df.drop(columns=[OBJETIVO])
+    y = df[OBJETIVO]
+    return x, y
+
+
+def crear_modelo_optimizado() -> GridSearchCV:
+    """Crea el pipeline + GridSearchCV del RandomForest."""
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), list(COLUMNAS_CATEGORICAS)),
+        ],
+        remainder="passthrough",
+    )
+
+    pipe = Pipeline(
+        steps=[
+            ("pre", pre),
+            ("clf", RandomForestClassifier(random_state=42)),
+        ]
+    )
+
+    return GridSearchCV(
+        estimator=pipe,
+        param_grid=GRILLA_PARAMETROS,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        refit=True,
+        verbose=0,
+    )
+
+
+def calcular_metricas(dataset: str, y_true, y_pred) -> dict[str, Any]:
+    """Calcula métricas y retorna diccionario para JSONL."""
+    return {
+        "type": "metrics",
+        "dataset": dataset,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+
+def calcular_matriz_confusion(dataset: str, y_true, y_pred) -> dict[str, Any]:
+    """Construye el dict de la matriz de confusión en el formato del enunciado."""
+    cm = confusion_matrix(y_true, y_pred)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset,
+        "true_0": {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+        "true_1": {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])},
+    }
+
+
+def entrenar_evaluar_y_guardar(rutas: RutasProyecto = RutasProyecto()) -> None:
+    """Ejecuta todo el flujo: carga, limpia, entrena, evalúa y guarda salidas."""
+    train_raw, test_raw = cargar_train_y_test(rutas.carpeta_entrada)
+
+    train = depurar_dataset(train_raw)
+    test = depurar_dataset(test_raw)
+
+    x_train, y_train = separar_xy(train)
+    x_test, y_test = separar_xy(test)
+
+    modelo = crear_modelo_optimizado()
+    modelo.fit(x_train, y_train)
+
+    guardar_modelo_gzip(rutas.ruta_modelo, modelo)
+
+    pred_train = modelo.predict(x_train)
+    pred_test = modelo.predict(x_test)
+
+    filas = [
+        calcular_metricas("train", y_train, pred_train),
+        calcular_metricas("test", y_test, pred_test),
+        calcular_matriz_confusion("train", y_train, pred_train),
+        calcular_matriz_confusion("test", y_test, pred_test),
+    ]
+
+    escribir_jsonl(rutas.ruta_metricas, filas)
+
+if __name__ == "__main__":
+    entrenar_evaluar_y_guardar()
